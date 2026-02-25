@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>SeerSniff — Packet Inspector</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 16px; background: #f6f6f6; }
+        header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+        .container { display:flex; gap:12px; }
+        .panel { background:white; padding:12px; border-radius:6px; flex:1; min-width:200px; max-height:80vh; overflow:auto; box-shadow:0 1px 4px rgba(0,0,0,0.06); }
+        pre { font-family: monospace; font-size:13px; }
+        .proto ul { padding-left:16px; }
+        .controls { display:flex; gap:8px; }
+    </style>
+</head>
+<body>
+<header>
+    <div>
+        <h2 style="margin:0;">SeerSniff Packet Inspector</h2>
+        <div style="font-size:0.9em; color:#555;">A lightweight Wireshark-like view</div>
+    </div>
+    <div class="controls">
+        <input id="sensorIdInput" placeholder="sensorId" />
+        <input id="packetIdInput" placeholder="packetId" />
+        <button id="loadBtn">Load</button>
+        <button id="downloadBtn">Download HEX</button>
+    </div>
+</header>
+
+<div id="meta" style="margin-bottom:8px;"></div>
+
+<div class="container">
+    <div id="proto" class="panel proto"><strong>Protocol / Layers</strong><div id="protoTree"></div></div>
+    <div id="hex" class="panel"><strong>Hex Dump</strong><pre id="hexPre"></pre></div>
+    <div id="ascii" class="panel"><strong>ASCII</strong><pre id="asciiPre"></pre></div>
+</div>
+
+<script>
+    function qs(name) {
+        const u = new URL(window.location.href);
+        return u.searchParams.get(name);
+    }
+
+    const sensorInput = document.getElementById('sensorIdInput');
+    const packetInput = document.getElementById('packetIdInput');
+    const loadBtn = document.getElementById('loadBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+
+    sensorInput.value = qs('sensorId') || 'desktop-sniffer-1';
+    packetInput.value = qs('packetId') || '';
+
+    loadBtn.onclick = () => loadPacket(sensorInput.value, packetInput.value);
+    downloadBtn.onclick = () => {
+        const text = document.getElementById('hexPre').textContent || '';
+        const blob = new Blob([text], {type: 'text/plain'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = `packet-${sensorInput.value}-${packetInput.value}.hex.txt`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
+    async function loadPacket(sensorId, packetId) {
+        if (!sensorId || !packetId) {
+            alert('Provide sensorId and packetId');
+            return;
+        }
+        try {
+            const res = await fetch(`/ingest/packet/${encodeURIComponent(sensorId)}/${packetId}`);
+            if (!res.ok) {
+                alert('Failed to fetch packet: HTTP ' + res.status);
+                return;
+            }
+            const d = await res.json();
+            renderInspector(d);
+        } catch (e) {
+            console.error(e);
+            alert('Error fetching packet (console)');
+        }
+    }
+
+    function renderInspector(details) {
+        const meta = document.getElementById('meta');
+        meta.innerHTML = `<strong>Packet:</strong> ${details.packetId} &nbsp; <strong>Severity:</strong> ${details.severity} &nbsp; <strong>Score:</strong> ${details.score} &nbsp; <strong>TS:</strong> ${new Date(details.ts).toLocaleString()}`;
+
+        const raw = details.rawText || '';
+        const parts = raw.split(/\n\s*\n/, 2);
+        const hex = (parts[0] || '').trim();
+        const rest = (parts[1] || '').trim();
+
+        document.getElementById('hexPre').textContent = hex;
+        // Build printable ASCII preview
+        let ascii = '';
+        try {
+            const bytes = hex.replace(/\s+/g, '');
+            const chars = [];
+            for (let i = 0; i < bytes.length; i += 2) {
+                const b = parseInt(bytes.substr(i, 2), 16);
+                if (isNaN(b)) break;
+                chars.push((b >= 32 && b <= 126) ? String.fromCharCode(b) : '.');
+                if ((i/2 + 1) % 16 === 0) chars.push('\n');
+            }
+            ascii = chars.join('');
+        } catch (e) { ascii = ''; }
+        document.getElementById('asciiPre').textContent = ascii;
+
+        // Protocol tree: split rest by lines, group them into an expandable list
+        const protoTree = document.getElementById('protoTree');
+        protoTree.innerHTML = '';
+        const lines = rest.split('\n').map(l => l.trim()).filter(Boolean);
+        if (lines.length === 0) protoTree.textContent = '(no textual decode available)';
+        else {
+            const ul = document.createElement('ul');
+            lines.forEach(l => {
+                const li = document.createElement('li');
+                li.textContent = l;
+                ul.appendChild(li);
+            });
+            protoTree.appendChild(ul);
+        }
+    }
+
+    // Auto-load if params present
+    if (qs('sensorId') && qs('packetId')) loadPacket(sensorInput.value, packetInput.value);
+</script>
+</body>
+</html>
