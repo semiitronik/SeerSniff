@@ -3,62 +3,101 @@ package com.seersniff.sensor.analysis;
 import org.pcap4j.packet.Packet;
 
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.HashMap;
 
+/**
+ * Fixed PacketAnalyzer: reuses a single AnalysisContext so window-based rules
+ * (ICMP/TCP/UDP burst detectors) can accumulate events across packets.
+ *
+ * Also provides safer rule execution and correlation bonus logic.
+ */
 public class PacketAnalyzer {
 
     private final List<SuspicionRule> rules;
+    private final AnalysisContext context;
 
     public PacketAnalyzer(List<SuspicionRule> rules) {
-        if (rules == null) {
-            throw new IllegalArgumentException("rules cannot be null");
-        }
-        this.rules = new ArrayList<>(rules); // defensive copy
+        this.rules = (rules == null) ? List.of() : List.copyOf(rules);
+        this.context = new AnalysisContext();
     }
 
     /**
-     * Returns an unmodifiable view of the configured rules.
-     * Prevents outside mutation.
+     * Live/default analysis (uses wall-clock time).
+     * Good for live capture.
      */
-    public List<SuspicionRule> getRules() {
-        return Collections.unmodifiableList(rules);
+    public SuspicionResult analyze(Packet packet) {
+        return analyze(packet, System.currentTimeMillis());
     }
 
-    public SuspicionResult analyze(Packet packet) {
+    /**
+     * Deterministic analysis using a caller-provided packet timestamp (ms).
+     * Useful for testing / pcap replay.
+     */
+    public SuspicionResult analyze(Packet packet, long packetTimeMillis) {
+        if (packet == null) return SuspicionResult.clean();
 
-        AnalysisContext ctx = new AnalysisContext();
+        // Set 'now' for burst/window rules
+        context.setCurrentPacketTime(packetTimeMillis);
+
+        int total = 0;
         List<String> reasons = new ArrayList<>();
-        Map<String, Integer> ruleScores = new HashMap<>();
-
-        int totalScore = 0;
+        Map<String, Integer> contributions = new LinkedHashMap<>();
 
         for (SuspicionRule rule : rules) {
-
-            int score = rule.score(packet, ctx);
-
-            if (score > 0) {
-                totalScore += score;
-                ruleScores.put(rule.getClass().getSimpleName(), score);
-                rule.explain(packet, ctx, reasons);
+            int s = safeScore(rule, packet);
+            if (s > 0) {
+                total += s;
+                contributions.merge(rule.getClass().getSimpleName(), s, Integer::sum);
+                safeExplain(rule, packet, reasons);
             }
         }
 
-        Severity severity = mapSeverity(totalScore);
+        // Optional correlation bonus: scan burst + high-risk port increases confidence
+        boolean scanBurst = reasons.stream().anyMatch(r -> r.toLowerCase().contains("port scan") || r.toLowerCase().contains("port scan burst"));
+        boolean highRiskPort = reasons.stream().anyMatch(r ->
+                r.contains("445") || r.contains("3389") || r.toLowerCase().contains("telnet"));
 
-        return new SuspicionResult(
-                totalScore,
-                severity,
-                reasons,
-                ruleScores
-        );
+        int bonus = 0;
+        if (scanBurst && highRiskPort) bonus = 10;
+        if (bonus > 0) {
+            total += bonus;
+            contributions.put("CorrelationBonus", bonus);
+            reasons.add("Correlation: scan burst + high-risk service targeting increases confidence.");
+        }
+
+        int finalScore = Math.min(total, 100);
+        Severity sev = (finalScore >= 70) ? Severity.HIGH
+                : (finalScore >= 45) ? Severity.MEDIUM
+                : Severity.LOW;
+
+        return new SuspicionResult(finalScore, sev, reasons, contributions);
     }
 
-    private Severity mapSeverity(int score) {
-        if (score >= 80) return Severity.HIGH;
-        if (score >= 40) return Severity.MEDIUM;
-        return Severity.LOW;
+    public AnalysisContext getContext() {
+        return context;
+    }
+
+    /** Exposes the active rules (useful for exports / experiment reports). */
+    public List<SuspicionRule> getRules() {
+        return rules;
+    }
+
+    private int safeScore(SuspicionRule rule, Packet packet) {
+        try {
+            return rule.score(packet, context);
+        } catch (Exception e) {
+            System.err.println("[PacketAnalyzer] rule.score() threw for " + rule.getClass().getSimpleName() + ": " + e.getMessage());
+            return 0;
+        }
+    }
+
+    private void safeExplain(SuspicionRule rule, Packet packet, List<String> reasons) {
+        try {
+            rule.explain(packet, context, reasons);
+        } catch (Exception e) {
+            System.err.println("[PacketAnalyzer] rule.explain() threw for " + rule.getClass().getSimpleName() + ": " + e.getMessage());
+        }
     }
 }

@@ -29,6 +29,14 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Fixed version with:
+ * - Proper thread synchronization (synchronized start/stop)
+ * - Thread.join() with timeout for clean shutdown
+ * - Exception handling in packet processing loop
+ * - Defensive null checks
+ * - Better logging
+ */
 public class CaptureEngine {
 
     private final String sensorId;
@@ -50,12 +58,15 @@ public class CaptureEngine {
     // Packet IDs for web list selection + details fetch
     private final AtomicLong packetIdSeq = new AtomicLong(0);
 
-    // ---- Option B: cache details locally, only send on FETCH_PACKET_DETAILS ----
+    // ---- cache details locally, only send on FETCH_PACKET_DETAILS ----
     private static final int MAX_DETAIL_CACHE = 1000;
     private final Map<Long, PacketDetails> detailCache = new ConcurrentHashMap<>();
     private final Deque<Long> detailOrder = new ArrayDeque<>();
 
-    // Analyzer (make sure these rule classes exist in your sensor project)
+    // ✅ ADDED: Lock for thread-safe start/stop operations
+    private final Object threadLock = new Object();
+
+    // Analyzer
     private final PacketAnalyzer analyzer = new PacketAnalyzer(List.of(
             new TcpScanFlagRule(),
             new TcpPortScanBurstRule(),
@@ -111,120 +122,201 @@ public class CaptureEngine {
 
     // ====== Capture control (for WebUI) ======
 
-    /** Start capture on the currently selected interface. */
+    /**
+     * Start capture on the currently selected interface.
+     * ✅ FIXED: Thread-safe with synchronization and no double-start
+     */
     public void start() {
-        if (capturing.get()) return;
-        if (device == null) throw new IllegalStateException("No interface selected.");
-
-        capturing.set(true);
-
-        captureThread = new Thread(() -> {
-            Thread telemetryThread = null;
-
-            try {
-                packetsCaptured.set(0);
-                packetsDropped.set(0);
-
-                int snaplen = 65536;
-                int timeoutMs = 150;
-
-                handle = device.openLive(snaplen, PromiscuousMode.PROMISCUOUS, timeoutMs);
-
-                // telemetry loop thread
-                telemetryThread = new Thread(this::telemetryLoop, "telemetry-loop");
-                telemetryThread.setDaemon(true);
-                telemetryThread.start();
-
-                while (capturing.get() && handle != null && handle.isOpen()) {
-
-                    Packet packet;
-                    try {
-                        packet = handle.getNextPacket(); // null on timeout
-                    } catch (NotOpenException e) {
-                        break;
-                    }
-
-                    if (packet == null) continue;
-
-                    packetsCaptured.incrementAndGet();
-
-                    long packetId = packetIdSeq.incrementAndGet();
-                    long ts = System.currentTimeMillis();
-
-                    // Analyze
-                    SuspicionResult result = analyzer.analyze(packet);
-
-                    // Cache FULL details locally (Option B)
-                    PacketDetails details = new PacketDetails(
-                            sensorId,
-                            ts,
-                            packetId,
-                            result.getScore(),
-                            result.getSeverity().name(),
-                            result.getReasons(),
-                            result.getRuleScores(),
-                            packet.toString()
-                    );
-
-                    cacheDetails(packetId, details);
-
-                    // Send only SUMMARY to backend for list display
-                    PacketMeta m = PacketMeta.from(packet);
-                    String protocol = m.isTcp ? "TCP" : (m.isUdp ? "UDP" : (m.isIcmp ? "ICMP" : "OTHER"));
-
-                    PacketSummary summary = new PacketSummary(
-                            sensorId,
-                            ts,
-                            packetId,
-                            m.srcIp,
-                            m.dstIp,
-                            m.srcPort,
-                            m.dstPort,
-                            protocol,
-                            m.length,
-                            result.getScore(),
-                            result.getSeverity().name()
-                    );
-
-                    api.postPacketSummary(summary);
-
-                    // Send alerts for MEDIUM/HIGH
-                    if (result.getSeverity() == Severity.HIGH || result.getSeverity() == Severity.MEDIUM) {
-                        sendAlert(
-                                result.getSeverity().name(),
-                                result.getScore(),
-                                "Suspicious network activity",
-                                result.getReasons(),
-                                result.getRuleScores()
-                        );
-                    }
-                }
-
-            } catch (Exception e) {
-                System.err.println("[CaptureEngine] Capture error: " + e.getMessage());
-            } finally {
-                capturing.set(false);
-                safeClose();
-
-                if (telemetryThread != null) telemetryThread.interrupt();
-                System.out.println("[CaptureEngine] Stopped.");
+        synchronized (threadLock) {
+            if (capturing.get()) {
+                System.out.println("[CaptureEngine] Capture already running");
+                return;
             }
-        }, "capture-thread");
+            if (device == null) throw new IllegalStateException("No interface selected.");
 
-        captureThread.start();
-        System.out.println("[CaptureEngine] Started.");
+            capturing.set(true);
+
+            captureThread = new Thread(() -> {
+                Thread telemetryThread = null;
+
+                try {
+                    packetsCaptured.set(0);
+                    packetsDropped.set(0);
+
+                    int snaplen = 65536;
+                    int timeoutMs = 150;
+
+                    handle = device.openLive(snaplen, PromiscuousMode.PROMISCUOUS, timeoutMs);
+
+                    // telemetry loop thread
+                    telemetryThread = new Thread(this::telemetryLoop, "telemetry-loop");
+                    telemetryThread.setDaemon(true);
+                    telemetryThread.start();
+
+                    System.out.println("[CaptureEngine] Capture started on " + device.getName());
+
+                    // ✅ MAIN PACKET LOOP with exception handling
+                    while (capturing.get() && handle != null && handle.isOpen()) {
+
+                        Packet packet;
+                        try {
+                            packet = handle.getNextPacket(); // null on timeout
+                        } catch (NotOpenException e) {
+                            System.out.println("[CaptureEngine] Handle closed, stopping capture");
+                            break;
+                        }
+
+                        if (packet == null) continue;
+
+                        // ✅ FIXED: Wrap packet processing in try-catch to prevent thread death
+                        try {
+                            packetsCaptured.incrementAndGet();
+
+                            long packetId = packetIdSeq.incrementAndGet();
+                            long ts = System.currentTimeMillis();
+                            byte[] rawBytes = packet.getRawData();
+                            String hexDump = (rawBytes == null) ? "" : bytesToHex(rawBytes);
+                            String rawTextCombined = hexDump + "\n\n" + packet.toString();
+                            PacketDetails details = new PacketDetails(
+                                    sensorId,
+                                    ts,
+                                    packetId,
+                                    r.getScore(),
+                                    r.getSeverity().name(),
+                                    r.getReasons(),
+                                    r.getRuleScores(),
+                                    rawTextCombined
+                            );
+
+                            cacheDetails(packetId, details);
+
+                            // ✅ Defensive: Analyze packet
+                            SuspicionResult result = analyzer.analyze(packet);
+
+                            if (result == null) {
+                                System.err.println("[CaptureEngine] Analyzer returned null result");
+                                continue;
+                            }
+
+                            // ✅ Cache FULL details locally
+                            try {
+                                PacketDetails details = new PacketDetails(
+                                        sensorId,
+                                        ts,
+                                        packetId,
+                                        result.getScore(),
+                                        result.getSeverity().name(),
+                                        result.getReasons(),
+                                        result.getRuleScores(),
+                                        packet.toString()
+                                );
+
+                                cacheDetails(packetId, details);
+                            } catch (Exception e) {
+                                System.err.println("[CaptureEngine] Error caching packet details: " + e.getMessage());
+                            }
+
+                            // ✅ Extract packet metadata
+                            PacketMeta m = PacketMeta.from(packet);
+                            String protocol = m.isTcp ? "TCP" : (m.isUdp ? "UDP" : (m.isIcmp ? "ICMP" : "OTHER"));
+
+                            // ✅ Send SUMMARY to backend for list display
+                            try {
+                                PacketSummary summary = new PacketSummary(
+                                        sensorId,
+                                        ts,
+                                        packetId,
+                                        m.srcIp,
+                                        m.dstIp,
+                                        m.srcPort,
+                                        m.dstPort,
+                                        protocol,
+                                        m.length,
+                                        result.getScore(),
+                                        result.getSeverity().name()
+                                );
+
+                                api.postPacketSummary(summary);
+                            } catch (Exception e) {
+                                System.err.println("[CaptureEngine] Error posting packet summary: " + e.getMessage());
+                            }
+
+                            // ✅ Send alerts for MEDIUM/HIGH severity
+                            if (result.getSeverity() == Severity.HIGH || result.getSeverity() == Severity.MEDIUM) {
+                                try {
+                                    sendAlert(
+                                            result.getSeverity().name(),
+                                            result.getScore(),
+                                            "Suspicious network activity",
+                                            result.getReasons(),
+                                            result.getRuleScores()
+                                    );
+                                } catch (Exception e) {
+                                    System.err.println("[CaptureEngine] Error sending alert: " + e.getMessage());
+                                }
+                            }
+
+                        } catch (Exception e) {
+                            System.err.println("[CaptureEngine] Error processing packet: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                            // Continue to next packet instead of crashing thread
+                        }
+                    }
+
+                } catch (Exception e) {
+                    System.err.println("[CaptureEngine] Capture error: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+                    e.printStackTrace();
+                } finally {
+                    capturing.set(false);
+                    safeClose();
+
+                    if (telemetryThread != null) {
+                        telemetryThread.interrupt();
+                    }
+
+                    System.out.println("[CaptureEngine] Stopped.");
+                }
+            }, "capture-thread");
+
+            captureThread.start();
+            System.out.println("[CaptureEngine] Started.");
+        }
     }
 
+    /**
+     * Stop capture.
+     * ✅ FIXED: Thread-safe with synchronization and join()
+     */
     public void stop() {
-        capturing.set(false);
-        safeClose();
-        if (captureThread != null) captureThread.interrupt();
+        synchronized (threadLock) {
+            capturing.set(false);
+            safeClose();
+
+            if (captureThread != null) {
+                captureThread.interrupt();
+
+                // ✅ Wait for thread to finish (with timeout)
+                try {
+                    captureThread.join(5000);  // Wait up to 5 seconds
+                    if (captureThread.isAlive()) {
+                        System.err.println("[CaptureEngine] Capture thread did not terminate within 5 seconds");
+                    }
+                } catch (InterruptedException e) {
+                    System.err.println("[CaptureEngine] Interrupted waiting for capture thread");
+                    Thread.currentThread().interrupt();
+                }
+
+                captureThread = null;
+            }
+        }
     }
 
     private void safeClose() {
         try {
-            if (handle != null && handle.isOpen()) handle.close();
-        } catch (Exception ignored) {
+            if (handle != null && handle.isOpen()) {
+                handle.close();
+            }
+        } catch (Exception e) {
+            System.err.println("[CaptureEngine] Error closing handle: " + e.getMessage());
         }
     }
 
@@ -232,26 +324,41 @@ public class CaptureEngine {
         detailCache.put(packetId, details);
         detailOrder.addLast(packetId);
 
+        // Evict oldest if cache is full
         while (detailOrder.size() > MAX_DETAIL_CACHE) {
             Long old = detailOrder.removeFirst();
             if (old != null) detailCache.remove(old);
         }
     }
+    private static final char[] HEX_ARRAY = "0123456789ABCDEF".toCharArray();
+    private static String bytesToHex(byte[] bytes) {
+        if (bytes == null) return "";
+        StringBuilder sb = new StringBuilder(bytes.length * 3); // include spaces
+        for (int i = 0; i < bytes.length; i++) {
+            int v = bytes[i] & 0xFF;
+            if (i % 16 == 0 && i != 0) sb.append('\n');
+            else if (i != 0) sb.append(' ');
+            sb.append(HEX_ARRAY[v >>> 4]);
+            sb.append(HEX_ARRAY[v & 0x0F]);
+        }
+        return sb.toString();
+    }
 
-    /**
-     * Called by CommandPoller when UI requests FETCH_PACKET_DETAILS (Option B).
-     * This posts ONE packet’s details to backend, which then broadcasts to WebUI via WS.
-     */
-    public void sendPacketDetails(Long packetId) {
-        if (packetId == null) return;
-
+    public void sendPacketDetails(long packetId) {
         PacketDetails details = detailCache.get(packetId);
-        if (details != null) {
+        if (details == null) {
+            System.err.println("[CaptureEngine] Packet details not found for ID: " + packetId);
+            return;
+        }
+
+        try {
             api.postPacketDetails(details);
-        } else {
-            System.out.println("[CaptureEngine] details not found for packetId=" + packetId);
+        } catch (Exception e) {
+            System.err.println("[CaptureEngine] Error sending packet details: " + e.getMessage());
         }
     }
+
+    // ====== Telemetry Loop (runs on separate thread) ======
 
     private void telemetryLoop() {
         while (capturing.get()) {
@@ -271,17 +378,23 @@ public class CaptureEngine {
                         0
                 );
 
-                api.postTelemetry(t);
+                try {
+                    api.postTelemetry(t);
+                } catch (Exception e) {
+                    System.err.println("[CaptureEngine] Error posting telemetry: " + e.getMessage());
+                }
+
                 Thread.sleep(1000);
 
             } catch (InterruptedException ie) {
+                System.out.println("[CaptureEngine] Telemetry thread interrupted");
                 return;
             } catch (Exception e) {
-                System.err.println("[CaptureEngine] telemetryLoop error: " + e.getMessage());
+                System.err.println("[CaptureEngine] Telemetry loop error: " + e.getMessage());
             }
         }
 
-        // final capturing=false telemetry
+        // Send final telemetry with capturing=false
         try {
             long now = System.currentTimeMillis();
             Telemetry t = new Telemetry(
@@ -295,7 +408,8 @@ public class CaptureEngine {
                     0
             );
             api.postTelemetry(t);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            System.err.println("[CaptureEngine] Error posting final telemetry: " + e.getMessage());
         }
     }
 
@@ -324,11 +438,10 @@ public class CaptureEngine {
                 reasons,
                 ruleScores
         );
-        api.postAlert(alert);
-    }
-
-    /** Optional: if you want to expose analyzer rules for debug/testing. */
-    public List<SuspicionRule> getRules() {
-        return analyzer.getRules();
+        try {
+            api.postAlert(alert);
+        } catch (Exception e) {
+            System.err.println("[CaptureEngine] Error sending alert: " + e.getMessage());
+        }
     }
 }
